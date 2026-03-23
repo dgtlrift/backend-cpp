@@ -18,7 +18,6 @@ use cddlc_ir::{
     IrModule, Occurrence, Primitive, StructDef, TypeDef, TypeRef,
 };
 
-
 pub struct CppBackend;
 
 impl Backend for CppBackend {
@@ -69,7 +68,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(FetchContent)
 FetchContent_Declare(nanocbor
     GIT_REPOSITORY https://github.com/bergzand/NanoCBOR.git
-    GIT_TAG        main
+    GIT_TAG        master
 )
 FetchContent_MakeAvailable(nanocbor)
 
@@ -723,8 +722,7 @@ fn emit_tests(module: &IrModule, opts: &CodegenOptions) -> String {
     w.line("int main() {");
     w.indent();
     for (_, def) in &module.types {
-        let _type_name = to_pascal_case(def.name());
-        let fn_name   = to_snake_case(def.name());
+        let fn_name = to_snake_case(def.name());
         w.line(&format!("test_{fn_name}_roundtrip();"));
     }
     w.line("std::printf(\"All C++ roundtrip tests passed.\\n\");");
