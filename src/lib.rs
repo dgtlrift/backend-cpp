@@ -73,7 +73,7 @@ FetchContent_Declare(nanocbor
 FetchContent_MakeAvailable(nanocbor)
 
 add_library({name}_cbor_cpp src/{name}.cpp)
-target_include_directories({name}_cbor_cpp PUBLIC include)
+target_include_directories({name}_cbor_cpp PUBLIC include ${{nanocbor_SOURCE_DIR}}/include)
 target_link_libraries({name}_cbor_cpp nanocbor)
 
 enable_testing()
