@@ -70,11 +70,16 @@ FetchContent_Declare(nanocbor
     GIT_REPOSITORY https://github.com/bergzand/NanoCBOR.git
     GIT_TAG        master
 )
-FetchContent_MakeAvailable(nanocbor)
+FetchContent_GetProperties(nanocbor)
+if(NOT nanocbor_POPULATED)
+    FetchContent_Populate(nanocbor)
+endif()
 
-add_library({name}_cbor_cpp src/{name}.cpp)
+add_library({name}_cbor_cpp
+    src/{name}.cpp
+    ${{nanocbor_SOURCE_DIR}}/src/nanocbor.c
+)
 target_include_directories({name}_cbor_cpp PUBLIC include ${{nanocbor_SOURCE_DIR}}/include)
-target_link_libraries({name}_cbor_cpp nanocbor)
 
 enable_testing()
 add_executable(test_roundtrip test/test_roundtrip.cpp)
