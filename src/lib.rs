@@ -8,7 +8,7 @@
 ///     test/test_roundtrip.cpp ← roundtrip tests
 
 use cddlc_codegen::{
-    capacity_value, constraint_to_c_check,
+    capacity_value, constraint_to_cpp_check,
     to_pascal_case, to_snake_case,
     Backend, CodegenError, CodegenOptions, CodegenOutput, GeneratedFile,
     IndentWriter,
@@ -255,7 +255,26 @@ fn emit_enum_hpp(w: &mut IndentWriter, e: &EnumDef, opts: &CodegenOptions) {
     w.line(&format!("struct {type_name} {{"));
     w.indent();
     w.line(&format!("using Variant = std::variant<{}>;", unique_types.join(", ")));
-    w.line("Variant value{};");
+    // Default-initialize to the first variant's value so default-constructed
+    // instances are valid for encode/decode roundtrip tests.
+    let default_init = e.variants.first().map(|v| match &v.ty {
+        TypeRef::Primitive(Primitive::Null) => "std::monostate{}".into(),
+        TypeRef::Primitive(Primitive::Tstr) => {
+            let s = v.name.to_lowercase().replace('_', "-");
+            format!("std::string_view({:?})", s)
+        }
+        TypeRef::Primitive(Primitive::Uint) => "uint64_t{0}".into(),
+        TypeRef::Primitive(Primitive::Int)  => "int64_t{0}".into(),
+        TypeRef::Primitive(Primitive::Float32 | Primitive::Float16) => "float{0}".into(),
+        TypeRef::Primitive(Primitive::Float64 | Primitive::Float)   => "double{0}".into(),
+        TypeRef::Named(n) => format!("{}{{}}",to_pascal_case(n)),
+        _ => String::new(),
+    }).unwrap_or_default();
+    if default_init.is_empty() {
+        w.line("Variant value{};");
+    } else {
+        w.line(&format!("Variant value{{{default_init}}};"));
+    }
     w.blank();
 
     // Named constructors for each variant
@@ -303,7 +322,7 @@ fn emit_array_hpp(w: &mut IndentWriter, a: &ArrayDef, opts: &CodegenOptions) {
     w.line("if (count != o.count) return false;");
     w.line("for (std::size_t i = 0; i < count; i++) {");
     w.indent();
-    w.line("if (items[i] != o.items[i]) return false;");
+    w.line("if (!(items[i] == o.items[i])) return false;");
     w.dedent();
     w.line("}");
     w.line("return true;");
@@ -322,7 +341,25 @@ fn emit_alias_hpp(w: &mut IndentWriter, a: &AliasDef, opts: &CodegenOptions) {
         let inner = cpp_typeref(&a.ty, opts);
         w.line(&format!("struct {type_name} {{"));
         w.indent();
-        w.line(&format!("{inner} value{{}};"));
+        // Generate a valid default for size-constrained string fields so that
+        // default-constructed instances satisfy constraints and roundtrip cleanly.
+        let size_n = a.constraints.iter().find_map(|c| match c {
+            Constraint::SizeExact(n) => Some(*n),
+            Constraint::SizeRange { min: Some(n), .. } => Some(*n),
+            _ => None,
+        });
+        let value_default = match (&a.ty, size_n) {
+            (TypeRef::Primitive(Primitive::Tstr), Some(n)) => {
+                let s = "a".repeat(n);
+                format!("value{{std::string_view({:?}, {n})}}", s)
+            }
+            (TypeRef::Primitive(Primitive::Bstr | Primitive::Any), Some(_n)) => {
+                // bstr: leave as-is; static buffer needed, keep empty default
+                "value{}".into()
+            }
+            _ => "value{}".into(),
+        };
+        w.line(&format!("{inner} {value_default};"));
         w.line(&format!("bool operator==(const {type_name} &o) const noexcept {{ return value == o.value; }}"));
         w.dedent();
         w.line("};");
@@ -374,11 +411,33 @@ fn emit_encode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
             } else {
                 s.fields.iter().collect()
             };
-            w.line(&format!("nanocbor_fmt_map(enc, {});", fields.len()));
+            let req_count = fields.iter()
+                .filter(|f| !matches!(f.occurrence, Occurrence::Optional))
+                .count();
+            let opt_fields: Vec<_> = fields.iter()
+                .filter(|f| matches!(f.occurrence, Occurrence::Optional))
+                .collect();
+            if opt_fields.is_empty() {
+                w.line(&format!("nanocbor_fmt_map(enc, {req_count}u);"));
+            } else {
+                let opt_parts: Vec<String> = opt_fields.iter()
+                    .map(|f| format!("(val.{}.has_value() ? 1u : 0u)", to_snake_case(&f.name)))
+                    .collect();
+                w.line(&format!("nanocbor_fmt_map(enc, {req_count}u + {});", opt_parts.join(" + ")));
+            }
             for f in &fields {
                 let fname = to_snake_case(&f.name);
-                w.line(&format!("nanocbor_put_tstr(enc, {:?});", f.name.as_str()));
-                emit_cpp_encode_field(w, &f.ty, &format!("val.{fname}"), &f.occurrence, opts);
+                if matches!(f.occurrence, Occurrence::Optional) {
+                    w.line(&format!("if (val.{fname}.has_value()) {{"));
+                    w.indent();
+                    w.line(&format!("nanocbor_put_tstr(enc, {:?});", f.name.as_str()));
+                    emit_cpp_encode_field(w, &f.ty, &format!("(*val.{fname})"), &f.occurrence, opts);
+                    w.dedent();
+                    w.line("}");
+                } else {
+                    w.line(&format!("nanocbor_put_tstr(enc, {:?});", f.name.as_str()));
+                    emit_cpp_encode_field(w, &f.ty, &format!("val.{fname}"), &f.occurrence, opts);
+                }
             }
             w.line("return NANOCBOR_OK;");
         }
@@ -404,7 +463,7 @@ fn emit_encode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
                     TypeRef::Primitive(Primitive::Tstr) => {
                         w.line("if constexpr (std::is_same_v<T, std::string_view>) {");
                         w.indent();
-                        w.line("nanocbor_put_tstr_len(enc, v.data(), v.size());");
+                        w.line("nanocbor_put_tstrn(enc, v.data(), v.size());");
                         w.line("return NANOCBOR_OK;");
                         w.dedent();
                         w.line("}");
@@ -508,7 +567,7 @@ fn cpp_encode_call(p: &Primitive, expr: &str) -> String {
         Primitive::Int       => format!("nanocbor_fmt_int(enc, {expr})"),
         Primitive::Float32 | Primitive::Float16 => format!("nanocbor_fmt_float(enc, {expr})"),
         Primitive::Float64 | Primitive::Float   => format!("nanocbor_fmt_double(enc, {expr})"),
-        Primitive::Tstr      => format!("nanocbor_put_tstr_len(enc, {expr}.data(), {expr}.size())"),
+        Primitive::Tstr      => format!("nanocbor_put_tstrn(enc, {expr}.data(), {expr}.size())"),
         Primitive::Bstr | Primitive::Any =>
             format!("nanocbor_put_bstr(enc, reinterpret_cast<const uint8_t*>({expr}.data()), {expr}.size())"),
     }
@@ -541,7 +600,7 @@ fn emit_decode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
                 let fkey  = f.name.as_str();
                 w.line(&format!("if (key == {:?}) {{", fkey));
                 w.indent();
-                emit_cpp_decode_field(w, &f.ty, &format!("out.{fname}"), &f.constraints, fkey, opts);
+                emit_cpp_decode_field(w, &f.ty, &format!("out.{fname}"), &f.constraints, fkey, "&map", opts);
                 w.dedent();
                 w.line("} else");
             }
@@ -573,7 +632,7 @@ fn emit_decode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
                     let cddl_str = v.name.to_lowercase().replace('_', "-");
                     let vname = to_pascal_case(&v.name);
                     let type_name2 = to_pascal_case(&e.name);
-                    w.line(&format!("if (sv == {:?}) {{ out = {}::make_{}(); return NANOCBOR_OK; }}", cddl_str, type_name2, vname));
+                    w.line(&format!("if (sv == {:?}) {{ out = {}::make_{}(sv); return NANOCBOR_OK; }}", cddl_str, type_name2, vname));
                 }
             }
             w.line("return -1;");
@@ -609,7 +668,7 @@ fn emit_decode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
             w.line("out.count = 0;");
             w.line(&format!("while (!nanocbor_at_end(&arr) && out.count < {cap}) {{"));
             w.indent();
-            emit_cpp_decode_field(w, &a.element, "out.items[out.count]", &[], "item", opts);
+            emit_cpp_decode_field(w, &a.element, "out.items[out.count]", &[], "item", "&arr", opts);
             w.line("out.count++;");
             w.dedent();
             w.line("}");
@@ -627,7 +686,7 @@ fn emit_decode_fn(w: &mut IndentWriter, def: &TypeDef, opts: &CodegenOptions) {
             } else {
                 "out"
             };
-            emit_cpp_decode_field(w, &a.ty, dest, &a.constraints, "value", opts);
+            emit_cpp_decode_field(w, &a.ty, dest, &a.constraints, "value", "dec", opts);
             w.line("return NANOCBOR_OK;");
         }
         TypeDef::Map(_) => {
@@ -645,14 +704,15 @@ fn emit_cpp_decode_field(
     dest:        &str,
     constraints: &[Constraint],
     field_name:  &str,
+    dec_expr:    &str,
     opts:        &CodegenOptions,
 ) {
     match ty {
         TypeRef::Primitive(p) => {
-            let call = cpp_decode_call(p, dest);
+            let call = cpp_decode_call(p, dest, dec_expr);
             w.line(&format!("if ({call} < 0) return -1;"));
             for c in constraints {
-                if let Some(check) = constraint_to_c_check(c, dest) {
+                if let Some(check) = constraint_to_cpp_check(c, dest) {
                     w.line(&format!("if (!({check})) {{"));
                     w.indent();
                     w.line(&format!(
@@ -666,37 +726,37 @@ fn emit_cpp_decode_field(
             }
         }
         TypeRef::Named(_) => {
-            w.line(&format!("if (decode(dec, {dest}, cb, ctx) < 0) return -1;"));
+            w.line(&format!("if (decode({dec_expr}, {dest}, cb, ctx) < 0) return -1;"));
         }
         TypeRef::Tagged(tag, inner) => {
             w.line("{ uint32_t tag;");
-            w.line("  if (nanocbor_get_tag(dec, &tag) < 0) return -1;");
+            w.line(&format!("  if (nanocbor_get_tag({dec_expr}, &tag) < 0) return -1;"));
             w.line(&format!("  if (tag != {}) return -1;", tag.0));
-            emit_cpp_decode_field(w, inner, dest, constraints, field_name, opts);
+            emit_cpp_decode_field(w, inner, dest, constraints, field_name, dec_expr, opts);
             w.line("}");
         }
         TypeRef::Choice(_) => {
-            w.line("nanocbor_skip(dec); // choice");
+            w.line(&format!("nanocbor_skip({dec_expr}); // choice"));
         }
     }
 }
 
-fn cpp_decode_call(p: &Primitive, dest: &str) -> String {
+fn cpp_decode_call(p: &Primitive, dest: &str, dec: &str) -> String {
     match p {
-        Primitive::Bool      => format!("nanocbor_get_bool(dec, &{dest})"),
-        Primitive::Null | Primitive::Undefined => "nanocbor_get_null(dec)".into(),
-        Primitive::Uint      => format!("nanocbor_get_uint64(dec, reinterpret_cast<uint64_t*>(&{dest}))"),
-        Primitive::Int       => format!("nanocbor_get_int64(dec, reinterpret_cast<int64_t*>(&{dest}))"),
+        Primitive::Bool      => format!("nanocbor_get_bool({dec}, &{dest})"),
+        Primitive::Null | Primitive::Undefined => format!("nanocbor_get_null({dec})"),
+        Primitive::Uint      => format!("nanocbor_get_uint64({dec}, reinterpret_cast<uint64_t*>(&{dest}))"),
+        Primitive::Int       => format!("nanocbor_get_int64({dec}, reinterpret_cast<int64_t*>(&{dest}))"),
         Primitive::Float32 | Primitive::Float16 =>
-            format!("nanocbor_get_float(dec, &{dest})"),
+            format!("nanocbor_get_float({dec}, &{dest})"),
         Primitive::Float64 | Primitive::Float =>
-            format!("nanocbor_get_double(dec, &{dest})"),
+            format!("nanocbor_get_double({dec}, &{dest})"),
         Primitive::Tstr => format!(
-            "({{ const uint8_t *_p; size_t _l; int _r = nanocbor_get_tstr(dec, &_p, &_l); \
+            "({{ const uint8_t *_p; size_t _l; int _r = nanocbor_get_tstr({dec}, &_p, &_l); \
              if (_r >= 0) {dest} = std::string_view(reinterpret_cast<const char*>(_p), _l); _r; }})"
         ),
         Primitive::Bstr | Primitive::Any => format!(
-            "({{ const uint8_t *_p; size_t _l; int _r = nanocbor_get_bstr(dec, &_p, &_l); \
+            "({{ const uint8_t *_p; size_t _l; int _r = nanocbor_get_bstr({dec}, &_p, &_l); \
              if (_r >= 0) {dest} = std::string_view(reinterpret_cast<const char*>(_p), _l); _r; }})"
         ),
     }
@@ -748,10 +808,47 @@ fn emit_cpp_type_test(w: &mut IndentWriter, def: &TypeDef, _opts: &CodegenOption
     w.indent();
 
     match def {
+        TypeDef::Alias(a) if !a.constraints.is_empty() => {
+            // For size-constrained aliases, construct a valid test value.
+            let n = a.constraints.iter().find_map(|c| match c {
+                cddlc_ir::Constraint::SizeExact(n) => Some(*n),
+                cddlc_ir::Constraint::SizeRange { min: Some(n), .. } => Some(*n),
+                _ => None,
+            });
+            if let Some(n) = n {
+                match &a.ty {
+                    TypeRef::Primitive(Primitive::Tstr) => {
+                        let s = "a".repeat(n);
+                        w.line(&format!("{type_name} original{{ std::string_view({:?}, {n}) }};", s));
+                    }
+                    TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => {
+                        // bstr alias: value is std::string_view over a static byte array
+                        let bytes: Vec<String> = (0..n).map(|i| format!("0x{:02x}", (i % 256) as u8)).collect();
+                        w.line(&format!("static const uint8_t _bytes[{n}] = {{{}}};", bytes.join(", ")));
+                        w.line(&format!("{type_name} original{{ std::string_view(reinterpret_cast<const char*>(_bytes), {n}) }};"));
+                    }
+                    _ => { w.line(&format!("{type_name} original{{}};")) }
+                }
+            } else {
+                w.line(&format!("{type_name} original{{}};"));
+            }
+        }
         TypeDef::Enum(e) => {
             if let Some(v) = e.variants.first() {
                 let vname = to_pascal_case(&v.name);
-                w.line(&format!("{type_name} original = {type_name}::make_{vname}();"));
+                let arg = match &v.ty {
+                    TypeRef::Primitive(Primitive::Null) => String::new(),
+                    TypeRef::Primitive(Primitive::Tstr) => {
+                        let cddl_str = v.name.to_lowercase().replace('_', "-");
+                        format!("std::string_view({:?})", cddl_str)
+                    }
+                    TypeRef::Primitive(Primitive::Uint) => "0u".into(),
+                    TypeRef::Primitive(Primitive::Int)  => "0".into(),
+                    TypeRef::Primitive(p) => cpp_primitive(p, _opts).to_string() + "{}",
+                    TypeRef::Named(n) => format!("{}{{}}",to_pascal_case(n)),
+                    _ => String::new(),
+                };
+                w.line(&format!("{type_name} original = {type_name}::make_{vname}({arg});"));
             } else {
                 w.line(&format!("{type_name} original{{}};"));
             }
