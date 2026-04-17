@@ -1,10 +1,11 @@
 /// Integration tests for backend-cpp.
 ///
-/// The backend emits 4 files:
+/// The backend emits 5 files:
 ///   files[0] = CMakeLists.txt
 ///   files[1] = include/<module>.hpp
-///   files[2] = src/<module>.cpp
-///   files[3] = test/test_roundtrip.cpp
+///   files[2] = include/nanocbor_compat.h
+///   files[3] = src/<module>.cpp
+///   files[4] = test/test_roundtrip.cpp
 
 use std::path::PathBuf;
 use backend_cpp::CppBackend;
@@ -29,12 +30,13 @@ fn compile_with_opts(src: &str, opts: CodegenOptions) -> GeneratedCrate {
     let parsed  = parse_cddl(src, PathBuf::from("test.cddl")).expect("parse");
     let lowered = lower(&parsed.value, 16, 64).expect("lower");
     let out     = CppBackend.generate(&lowered.module, &opts).expect("generate");
-    assert_eq!(out.files.len(), 4, "expected 4 output files");
+    assert_eq!(out.files.len(), 5, "expected 5 output files");
     GeneratedCrate {
         cmake:  out.files[0].content.clone(),
         header: out.files[1].content.clone(),
-        source: out.files[2].content.clone(),
-        tests:  out.files[3].content.clone(),
+        // files[2] = include/nanocbor_compat.h (platform shim, not tested here)
+        source: out.files[3].content.clone(),
+        tests:  out.files[4].content.clone(),
     }
 }
 
@@ -46,11 +48,12 @@ fn test_emits_four_files() {
     let parsed = parse_cddl("x = uint", PathBuf::from("t.cddl")).unwrap();
     let lowered = lower(&parsed.value, 16, 64).unwrap();
     let out    = CppBackend.generate(&lowered.module, &opts).unwrap();
-    assert_eq!(out.files.len(), 4);
+    assert_eq!(out.files.len(), 5);
     assert!(out.files[0].path.ends_with("CMakeLists.txt"));
     assert!(out.files[1].path.ends_with(".hpp"));
-    assert!(out.files[2].path.ends_with(".cpp"));
-    assert!(out.files[3].path.ends_with("test_roundtrip.cpp"));
+    assert!(out.files[2].path.ends_with("nanocbor_compat.h"));
+    assert!(out.files[3].path.ends_with(".cpp"));
+    assert!(out.files[4].path.ends_with("test_roundtrip.cpp"));
 }
 
 #[test]
@@ -61,8 +64,9 @@ fn test_crate_dir_named_after_module() {
     let out    = CppBackend.generate(&lowered.module, &opts).unwrap();
     assert!(out.files[0].path.starts_with("sensor-cbor-cpp/"));
     assert!(out.files[1].path.starts_with("sensor-cbor-cpp/include/"));
-    assert!(out.files[2].path.starts_with("sensor-cbor-cpp/src/"));
-    assert!(out.files[3].path.starts_with("sensor-cbor-cpp/test/"));
+    assert!(out.files[2].path.starts_with("sensor-cbor-cpp/include/"));
+    assert!(out.files[3].path.starts_with("sensor-cbor-cpp/src/"));
+    assert!(out.files[4].path.starts_with("sensor-cbor-cpp/test/"));
 }
 
 // ── CMakeLists.txt ────────────────────────────────────────────────────────────
