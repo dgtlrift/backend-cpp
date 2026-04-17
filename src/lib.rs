@@ -93,15 +93,21 @@ project({name}_cbor_cpp C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# macOS: force-include compat shim for nanocbor's Linux byte-order functions.
+# Must be set before FetchContent_MakeAvailable so it applies to nanocbor's
+# own compilation units as well.
+if(APPLE)
+    set(_nanocbor_compat "${{CMAKE_CURRENT_SOURCE_DIR}}/include/nanocbor_compat.h")
+    add_compile_options(-include "${{_nanocbor_compat}}")
+endif()
+
 include(FetchContent)
 FetchContent_Declare(nanocbor
     GIT_REPOSITORY https://github.com/bergzand/NanoCBOR.git
     GIT_TAG        master
 )
-FetchContent_GetProperties(nanocbor)
-if(NOT nanocbor_POPULATED)
-    FetchContent_Populate(nanocbor)
-endif()
+set(NANOCBOR_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(nanocbor)
 
 file(GLOB NANOCBOR_SOURCES "${{nanocbor_SOURCE_DIR}}/src/*.c")
 
@@ -110,13 +116,6 @@ add_library({name}_cbor_cpp
     ${{NANOCBOR_SOURCES}}
 )
 target_include_directories({name}_cbor_cpp PUBLIC include ${{nanocbor_SOURCE_DIR}}/include)
-
-# macOS: nanocbor uses Linux-only byte-order functions; force-include a compat shim
-if(APPLE)
-    target_compile_options({name}_cbor_cpp PRIVATE
-        -include "${{CMAKE_CURRENT_SOURCE_DIR}}/include/nanocbor_compat.h"
-    )
-endif()
 
 enable_testing()
 add_executable(test_roundtrip test/test_roundtrip.cpp)
@@ -747,7 +746,7 @@ fn emit_cpp_decode_field(
             let call = cpp_decode_call(p, dest, dec_expr);
             w.line(&format!("if ({call} < 0) return -1;"));
             for c in constraints {
-                if let Some(check) = constraint_to_cpp_check(c, dest) {
+                if let Some(check) = cpp_constraint_check(c, dest, p) {
                     w.line(&format!("if (!({check})) {{"));
                     w.indent();
                     w.line(&format!(
@@ -773,6 +772,49 @@ fn emit_cpp_decode_field(
         TypeRef::Choice(_) => {
             w.line(&format!("nanocbor_skip({dec_expr}); // choice"));
         }
+    }
+}
+
+/// Type-aware constraint check: for integer primitives `.size N` means
+/// "fits in N bytes" (value-range), not a `.size()` call.
+fn cpp_constraint_check(c: &Constraint, val_expr: &str, p: &Primitive) -> Option<String> {
+    match c {
+        Constraint::SizeExact(n) => match p {
+            Primitive::Uint => {
+                let max = cpp_uint_max_for_bytes(*n)?;
+                Some(format!("{val_expr} <= {max}"))
+            }
+            Primitive::Int => {
+                let (lo, hi) = cpp_int_range_for_bytes(*n)?;
+                Some(format!("{val_expr} >= {lo} && {val_expr} <= {hi}"))
+            }
+            _ => constraint_to_cpp_check(c, val_expr),
+        },
+        Constraint::SizeRange { .. } => match p {
+            Primitive::Uint | Primitive::Int => None, // uncommon; skip
+            _ => constraint_to_cpp_check(c, val_expr),
+        },
+        _ => constraint_to_cpp_check(c, val_expr),
+    }
+}
+
+fn cpp_uint_max_for_bytes(n: usize) -> Option<String> {
+    match n {
+        1 => Some("0xFFULL".into()),
+        2 => Some("0xFFFFULL".into()),
+        4 => Some("0xFFFFFFFFULL".into()),
+        8 => None, // uint64 always fits
+        _ => None,
+    }
+}
+
+fn cpp_int_range_for_bytes(n: usize) -> Option<(i64, i64)> {
+    match n {
+        1 => Some((-128, 127)),
+        2 => Some((-32768, 32767)),
+        4 => Some((-2147483648, 2147483647)),
+        8 => None,
+        _ => None,
     }
 }
 
