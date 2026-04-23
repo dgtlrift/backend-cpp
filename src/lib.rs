@@ -865,6 +865,30 @@ fn cpp_decode_call(p: &Primitive, dest: &str, dec: &str) -> String {
 
 // ── Test file ─────────────────────────────────────────────────────────────────
 
+/// Returns the first concrete Primitive in a TypeRef, following Tagged and Choice.
+fn effective_primitive(ty: &TypeRef) -> Option<&Primitive> {
+    match ty {
+        TypeRef::Primitive(p)     => Some(p),
+        TypeRef::Choice(cs)       => cs.first().and_then(|c| effective_primitive(c)),
+        TypeRef::Tagged(_, inner) => effective_primitive(inner),
+        _ => None,
+    }
+}
+
+/// If `type_name` resolves to a `tstr .size N` alias, return `Some(N)`.
+fn tstr_size_constraint_for(type_name: &str, module: &IrModule) -> Option<usize> {
+    match module.types.get(type_name)? {
+        TypeDef::Alias(a) if matches!(&a.ty, TypeRef::Primitive(Primitive::Tstr)) => {
+            a.constraints.iter().find_map(|c| match c {
+                Constraint::SizeExact(n) => Some(*n),
+                Constraint::SizeRange { min: Some(n), .. } => Some(*n),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 fn emit_tests(module: &IrModule, opts: &CodegenOptions) -> String {
     let name  = module.name.as_str();
     let ns    = to_snake_case(name);
@@ -883,7 +907,7 @@ fn emit_tests(module: &IrModule, opts: &CodegenOptions) -> String {
     w.blank();
 
     for (_, def) in &module.types {
-        emit_cpp_type_test(&mut w, def, opts);
+        emit_cpp_type_test(&mut w, def, module, opts);
         w.blank();
     }
 
@@ -901,7 +925,7 @@ fn emit_tests(module: &IrModule, opts: &CodegenOptions) -> String {
     w.finish()
 }
 
-fn emit_cpp_type_test(w: &mut IndentWriter, def: &TypeDef, _opts: &CodegenOptions) {
+fn emit_cpp_type_test(w: &mut IndentWriter, def: &TypeDef, module: &IrModule, _opts: &CodegenOptions) {
     let type_name = to_pascal_case(def.name());
     let fn_name   = to_snake_case(def.name());
 
@@ -952,6 +976,69 @@ fn emit_cpp_type_test(w: &mut IndentWriter, def: &TypeDef, _opts: &CodegenOption
                 w.line(&format!("{type_name} original = {type_name}::make_{vname}({arg});"));
             } else {
                 w.line(&format!("{type_name} original{{}};"));
+            }
+        }
+        TypeDef::Struct(s) => {
+            w.line(&format!("{type_name} original{{}};"));
+            for f in &s.fields {
+                let fname = to_snake_case(&f.name);
+                // Skip optional and repeated fields
+                if !matches!(f.occurrence, Occurrence::Required) {
+                    continue;
+                }
+                // Resolve tagged inner type
+                let effective_ty = match &f.ty {
+                    TypeRef::Tagged(_, inner) => inner.as_ref(),
+                    other => other,
+                };
+                match effective_ty {
+                    TypeRef::Primitive(Primitive::Uint) => {
+                        w.line(&format!("original.{fname} = 42u;"));
+                    }
+                    TypeRef::Primitive(Primitive::Int) => {
+                        w.line(&format!("original.{fname} = -1;"));
+                    }
+                    TypeRef::Primitive(Primitive::Float32 | Primitive::Float16) => {
+                        w.line(&format!("original.{fname} = 1.0f;"));
+                    }
+                    TypeRef::Primitive(Primitive::Float64 | Primitive::Float) => {
+                        w.line(&format!("original.{fname} = 1.0;"));
+                    }
+                    TypeRef::Primitive(Primitive::Bool) => {
+                        w.line(&format!("original.{fname} = true;"));
+                    }
+                    TypeRef::Primitive(Primitive::Tstr) => {
+                        w.line(&format!("static const char _{fname}_str[] = \"hello\";"));
+                        w.line(&format!("original.{fname} = std::string_view(_{fname}_str);"));
+                    }
+                    TypeRef::Primitive(Primitive::Bstr | Primitive::Any) => {
+                        w.line(&format!("static const uint8_t _{fname}_cbor[1] = {{0xf6}};"));
+                        w.line(&format!("original.{fname} = std::string_view(reinterpret_cast<const char*>(_{fname}_cbor), 1);"));
+                    }
+                    TypeRef::Choice(_) => {
+                        match effective_primitive(effective_ty) {
+                            Some(Primitive::Tstr) => {
+                                w.line(&format!("static const char _{fname}_str[] = \"hello\";"));
+                                w.line(&format!("original.{fname} = std::string_view(_{fname}_str);"));
+                            }
+                            Some(Primitive::Bstr | Primitive::Any) => {
+                                w.line(&format!("static const uint8_t _{fname}_cbor[1] = {{0xf6}};"));
+                                w.line(&format!("original.{fname} = std::string_view(reinterpret_cast<const char*>(_{fname}_cbor), 1);"));
+                            }
+                            _ => {}
+                        }
+                    }
+                    TypeRef::Named(n) => {
+                        if let Some(sz) = tstr_size_constraint_for(n, module) {
+                            let s = "a".repeat(sz);
+                            w.line(&format!("{{ static const char _{fname}_str[] = {s:?}; original.{fname} = {}{{ std::string_view(_{fname}_str, {sz}) }}; }}", to_pascal_case(n)));
+                        }
+                        // Otherwise leave as default {}
+                    }
+                    _ => {
+                        // Leave as default {}
+                    }
+                }
             }
         }
         _ => {
